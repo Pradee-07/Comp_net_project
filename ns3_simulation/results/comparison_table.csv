@@ -1,0 +1,16 @@
+method,delay_ms,throughput_mbps,pdr
+Baseline (AODV),27.58,0.31,0.2626
+GEbPDCM,52.62,0.22,0.1852
+GEbPDCM + GEO,51.28,0.21,0.1737
+GEbPDCM + GEO + LTPM (ours),48.07,0.21,0.1736
+[paper] Edge computing,78.2,62.1,0.94
+[paper] Latency Control,71.5,65.8,0.95
+[paper] Congestion controlling protocol,69.3,68.2,0.955
+[paper] Resource allocation,66.1,71.4,0.96
+[paper] MEC,62.8,74.9,0.965
+[paper] DRL,58.4,79.3,0.97
+[paper] ACFP,54.9,82.7,0.975
+[paper] UA with SG,51.2,86.1,0.978
+[paper] Game theory,47.6,89.4,0.982
+[paper] 6TSCHD,44.3,91.8,0.985
+[paper] Proposed (paper's GEbPDCM),65.1,93.7,0.988
