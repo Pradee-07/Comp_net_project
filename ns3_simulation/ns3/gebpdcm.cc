@@ -38,6 +38,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "tiny_tts_weights.h"
 
 #include "ns3/aodv-module.h"
 #include "ns3/applications-module.h"
@@ -98,10 +99,13 @@ struct NodeAgentState
 {
     double load = 0.0;                 // Mbps, real signal: MAC queue bytes/sec this tick
     std::vector<double> loadHistory;
+    std::vector<std::array<float, 5>> telemetryHistory; // multivariate lookback for Tiny-TTS
     NodeStatusEnum status = NodeStatusEnum::SAFE;
     double trust = TRUST_INIT;         // LTPM: EWMA trust, fed by real Ipv4L3Protocol Tx/Drop traces
     uint32_t txThisTick = 0;
     uint32_t dropThisTick = 0;
+    float predLoad = 0.0f;
+    float predRisk = 0.0f;
 };
 
 static std::vector<NodeAgentState> g_agents;
@@ -111,6 +115,7 @@ static std::vector<Ipv4Address> g_nodeAddrs;   // mobile nodes' wifi IPs, index-
 static Ipv4Address g_bsAddr;
 static std::string g_scheme = "baseline";
 static double g_simTime = 100.0;
+static double g_speed = 10.0;
 static uint32_t g_migrations = 0;
 static bool g_verbose = false;
 
@@ -325,11 +330,14 @@ Trusted(uint32_t nodeIdx)
     return g_agents[nodeIdx].trust >= TRUST_MIN;
 }
 
-// Linear extrapolation one step ahead over the node's real load_history
-// (queue-Mbps readings) -- same least-squares slope as ltpm.py::forecast_load.
+// Load forecast: returns Tiny-TTS predicted load if available, or least-squares slope fallback.
 double
 ForecastLoad(const NodeAgentState& n)
 {
+    if (n.predLoad > 0.0f)
+    {
+        return static_cast<double>(n.predLoad);
+    }
     const auto& h = n.loadHistory;
     if (h.size() < 2)
     {
@@ -355,15 +363,24 @@ ForecastLoad(const NodeAgentState& n)
     return slope * sz + intercept; // one step past the last reading
 }
 
-// Same severity formula the aggregate Python model uses -- migrate ahead of
-// congestion once the *forecast* severity crosses the risk bar even though
-// the node's *current* load hasn't yet.
+// Preemptive migration: uses Tiny-TTS Transformer risk head and load forecast.
 bool
 ShouldPreemptivelyMigrate(const NodeAgentState& n)
 {
     const double ref = SEVERITY_REFERENCE_LOAD;
     const double riskBar = 0.5;
     double currentSeverity = std::max(0.0, n.load / ref - 0.5);
+    if (currentSeverity >= riskBar)
+    {
+        return false;
+    }
+
+    if (!n.telemetryHistory.empty())
+    {
+        double forecastSeverity = std::max(0.0, static_cast<double>(n.predLoad) / ref - 0.5);
+        return (n.predRisk >= 0.5f) || (forecastSeverity >= riskBar);
+    }
+
     double forecastSeverity = std::max(0.0, ForecastLoad(n) / ref - 0.5);
     return currentSeverity < riskBar && forecastSeverity >= riskBar;
 }
@@ -502,6 +519,7 @@ Tick(uint32_t tickNum)
     for (uint32_t i = 0; i < g_mobileNodes.size(); ++i)
     {
         NodeAgentState& n = g_agents[i];
+        double prevLoad = n.load;
         double sampled = SampleQueueLoadMbps(i);
         n.load = sampled;
         n.loadHistory.push_back(sampled);
@@ -511,6 +529,34 @@ Tick(uint32_t tickNum)
         }
 
         std::vector<uint32_t> neighbours = NeighboursWithin(i);
+
+        // Record multivariate telemetry for Tiny-TTS
+        float delta = static_cast<float>(sampled - prevLoad);
+        float n_count = static_cast<float>(neighbours.size());
+        float drops = static_cast<float>(n.dropThisTick);
+        float sp = static_cast<float>(g_speed);
+        n.telemetryHistory.push_back({static_cast<float>(sampled), delta, n_count, drops, sp});
+        if (n.telemetryHistory.size() > TinyTTS::SEQ_LEN)
+        {
+            n.telemetryHistory.erase(n.telemetryHistory.begin());
+        }
+
+        // Run Tiny-TTS Edge Transformer prediction for LTPM
+        if (g_scheme == "gebpdcm_ltpm")
+        {
+            float window[TinyTTS::SEQ_LEN][TinyTTS::D_INPUT] = {{0}};
+            size_t histSz = n.telemetryHistory.size();
+            for (size_t t = 0; t < TinyTTS::SEQ_LEN; ++t)
+            {
+                size_t srcIdx = (t + histSz >= TinyTTS::SEQ_LEN) ? (t + histSz - TinyTTS::SEQ_LEN) : 0;
+                for (int f = 0; f < TinyTTS::D_INPUT; ++f)
+                {
+                    window[t][f] = n.telemetryHistory[srcIdx][f];
+                }
+            }
+            TinyTTS::Predict(window, n.predLoad, n.predRisk);
+        }
+
         double P = PredictDataLoad(n);
         double Nd = NodeDensity(n, neighbours.size());
         double cs = NodeStatusScore(P, Nd);
@@ -619,6 +665,7 @@ main(int argc, char* argv[])
 
     g_scheme = scheme;
     g_simTime = simTime;
+    g_speed = speed;
 
     Config::SetDefault("ns3::WifiRemoteStationManager::NonUnicastMode", StringValue("DsssRate2Mbps"));
 

@@ -95,10 +95,20 @@ def run(scheme, speed=config.DEFAULT_SPEED, packet_size_kb=config.DEFAULT_PACKET
         for n in nodes:
             offered = rng.uniform(config.DATA_RATE_MIN, config.DATA_RATE_MAX)
             offered_this_tick[n.id] = offered
+            prev_load = n.load
             n.load += offered
             n.load_history.append(n.load)
             if len(n.load_history) > config.FORECAST_WINDOW:
                 n.load_history.pop(0)
+
+            # Record telemetry for Tiny-TTS Transformer
+            delta = n.load - prev_load
+            n_count = len(neighbours.get(n.id, []))
+            prev_drops = getattr(n, "last_drops", 0.0)
+            telemetry_frame = [n.load, delta, float(n_count), float(prev_drops), float(speed)]
+            n.telemetry_history.append(telemetry_frame)
+            if len(n.telemetry_history) > 10:
+                n.telemetry_history.pop(0)
 
         # 3. compute status for every node (status.py)
         for n in nodes:
@@ -109,6 +119,9 @@ def run(scheme, speed=config.DEFAULT_SPEED, packet_size_kb=config.DEFAULT_PACKET
         #    scheme 2/3 -> classify(cs) == 'congested'
         #    scheme 4   -> that, OR ltpm.should_preemptively_migrate() (forecast-based, ahead of congestion)
         if use_migration:
+            if scheme == "gebpdcm_ltpm":
+                ltpm.batch_evaluate_nodes(nodes)
+
             for n in nodes:
                 needs_migration = n.status == "congested" or (
                     scheme == "gebpdcm_ltpm" and ltpm.should_preemptively_migrate(n)
@@ -151,6 +164,7 @@ def run(scheme, speed=config.DEFAULT_SPEED, packet_size_kb=config.DEFAULT_PACKET
             queue_delay_ms = severity * 40.0
 
             delivered = int(packets_this_tick * (1 - drop_rate))
+            n.last_drops = float(packets_this_tick - delivered)
             packets_received += delivered
             hops_transmitted += packets_this_tick
             hops_received += delivered

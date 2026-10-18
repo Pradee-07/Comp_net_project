@@ -29,6 +29,7 @@ class Node:
     energy: float = 100.0      # remaining energy, mJ (starting budget, arbitrary but shared across schemes)
     trust: float = config.TRUST_INIT
     load_history: list = field(default_factory=list)  # recent load readings, most recent last
+    telemetry_history: list = field(default_factory=list)  # recent multivariate (load, delta, n_count, drops, speed) frames
     status: str = "safe"       # 'safe' | 'threshold' | 'congested', set each tick by status.py
     reliable: bool = True      # False = a persistently malicious/failing node (LTPM's trust target, see ltpm.py)
 
