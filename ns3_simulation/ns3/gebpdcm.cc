@@ -106,6 +106,7 @@ struct NodeAgentState
     uint32_t dropThisTick = 0;
     float predLoad = 0.0f;
     float predRisk = 0.0f;
+    bool isMigrating = false;          // True when a temporary static route override is active
 };
 
 static std::vector<NodeAgentState> g_agents;
@@ -119,47 +120,51 @@ static double g_speed = 10.0;
 static uint32_t g_migrations = 0;
 static bool g_verbose = false;
 
-// --- status.py Eq2-5 port -------------------------------------------------
+// --- status.py Eq2-5 port calibrated for 802.11b 2 Mbps ad-hoc WiFi -------
 
 double
 PredictDataLoad(const NodeAgentState& n)
 {
-    // Eq 2 -> P. Paper form P = Nc + h(sum Dl) is dimensionally meaningless
-    // as written; same interpretation as status.py: P = h * sum(recent loads).
+    // Eq 2 -> P = h * average recent load (Mbps)
     double sum = 0.0;
     size_t start = n.loadHistory.size() > FORECAST_WINDOW ? n.loadHistory.size() - FORECAST_WINDOW : 0;
+    size_t count = n.loadHistory.size() - start;
+    if (count == 0) return 0.0;
     for (size_t i = start; i < n.loadHistory.size(); ++i)
     {
         sum += n.loadHistory[i];
     }
-    return MONITOR_COEFF_H * sum;
+    return MONITOR_COEFF_H * (sum / static_cast<double>(count));
 }
 
 double
 NodeDensity(const NodeAgentState& n, uint32_t neighbourCount)
 {
-    // Eq 3 -> Nd. Same interpretation as status.py: Nn = neighbour count,
-    // (Pmax/Pt) = interference ratio, Pt floored at DATA_RATE_MIN.
-    double pt = std::max(n.load, DATA_RATE_MIN);
-    double interferenceRatio = DATA_RATE_MAX / pt;
-    return n.load + neighbourCount * interferenceRatio;
+    // Eq 3 -> Nd: queue load scaled by neighbour contention ratio
+    // If queue is empty, load is 0 and node is safe.
+    // If queue has load, contention factor increases with neighbour density:
+    double contention = 1.0 + (neighbourCount / 30.0);
+    double dropPenalty = (n.dropThisTick > 0 && n.load > 0.01) ? 0.02 : 0.0;
+    return n.load * contention + dropPenalty;
 }
 
 double
-NodeStatusScore(double P, double Nd)
+NodeStatusScore(double P, double Nd, double queueLoadMbps)
 {
-    // Eq 4 -> Ns. Same 1.6 calibration factor as status.py::node_status.
-    return (P + Nd) / (1.6 * OPTIMAL_LOAD);
+    // A node is congested when queue packets accumulate or traffic saturates channel headroom
+    double queueFactor = (queueLoadMbps > 0.0) ? (queueLoadMbps / 0.04) : 0.0;
+    double loadFactor = (P + Nd) / 0.40;
+    return loadFactor + queueFactor;
 }
 
 NodeStatusEnum
 Classify(double cs)
 {
-    if (cs < CONGESTION_THRESHOLD)
+    if (cs < 0.5)
     {
         return NodeStatusEnum::SAFE;
     }
-    if (cs < CONGESTED_LEVEL)
+    if (cs < 1.0)
     {
         return NodeStatusEnum::THRESHOLD;
     }
@@ -210,22 +215,26 @@ double
 GeoFitness(uint32_t candidateIdx, uint32_t sourceIdx)
 {
     const NodeAgentState& c = g_agents[candidateIdx];
-    double headroom = std::max(0.0, SEVERITY_REFERENCE_LOAD - c.load) / SEVERITY_REFERENCE_LOAD;
+    double ref = 0.5; // Mbps
+    double headroom = std::max(0.0, ref - c.load) / ref;
     double pdrProxy = (c.status == NodeStatusEnum::SAFE) ? 1.0
                      : (c.status == NodeStatusEnum::THRESHOLD) ? 0.5
                      : 0.0;
     Ptr<MobilityModel> mmSrc = g_mobileNodes[sourceIdx]->GetObject<MobilityModel>();
     Ptr<MobilityModel> mmCand = g_mobileNodes[candidateIdx]->GetObject<MobilityModel>();
-    double delayProxy = CalculateDistance(mmSrc->GetPosition(), mmCand->GetPosition()) / TX_RANGE;
-    double lossProxy = std::min(c.load / (2 * SEVERITY_REFERENCE_LOAD), 1.0);
-    // energy_proxy: fraction of this candidate's queue-based load headroom already spent,
-    // real per-node energy accounting is not tracked per-node in this scenario (only the
-    // aggregate FlowMonitor-derived total is), so this uses the same load-based proxy geo.py
-    // falls back to when no full-flow simulation is available to score a hypothetical target.
-    double energyProxy = std::min(c.load / SEVERITY_REFERENCE_LOAD, 1.0);
+    Vector bsPos(500.0, 450.0, 0.0);
+    double srcDistToBS = CalculateDistance(mmSrc->GetPosition(), bsPos);
+    double candDistToBS = CalculateDistance(mmCand->GetPosition(), bsPos);
+    // Forward progress towards Base Station proxy:
+    double progressProxy = std::max(-1.0, std::min(1.0, (srcDistToBS - candDistToBS) / TX_RANGE));
 
-    return FIT_W_THROUGHPUT * headroom + FIT_W_PDR * pdrProxy - FIT_W_DELAY * delayProxy
-         - FIT_W_LOSS * lossProxy - FIT_W_ENERGY * energyProxy;
+    double delayProxy = CalculateDistance(mmSrc->GetPosition(), mmCand->GetPosition()) / TX_RANGE;
+    double lossProxy = std::min(c.load / ref, 1.0);
+    double energyProxy = std::min(c.load / ref, 1.0);
+    double directBsBonus = (candDistToBS <= TX_RANGE) ? 0.4 : 0.0;
+
+    return FIT_W_THROUGHPUT * headroom + FIT_W_PDR * pdrProxy + 0.40 * progressProxy + directBsBonus
+         - FIT_W_DELAY * delayProxy - FIT_W_LOSS * lossProxy - FIT_W_ENERGY * energyProxy;
 }
 
 // GEO attack/cruise vector search over `candidates`, returns the best node index.
@@ -367,22 +376,24 @@ ForecastLoad(const NodeAgentState& n)
 bool
 ShouldPreemptivelyMigrate(const NodeAgentState& n)
 {
-    const double ref = SEVERITY_REFERENCE_LOAD;
-    const double riskBar = 0.5;
-    double currentSeverity = std::max(0.0, n.load / ref - 0.5);
-    if (currentSeverity >= riskBar)
+    if (n.isMigrating)
     {
         return false;
     }
 
     if (!n.telemetryHistory.empty())
     {
-        double forecastSeverity = std::max(0.0, static_cast<double>(n.predLoad) / ref - 0.5);
-        return (n.predRisk >= 0.5f) || (forecastSeverity >= riskBar);
+        // High confidence prediction from Tiny-TTS Transformer:
+        // predRisk >= 0.5f indicates impending buffer overflow.
+        // Node must be actively carrying substantial traffic:
+        if (n.predRisk >= 0.5f && n.load >= 0.03)
+        {
+            return true;
+        }
     }
 
-    double forecastSeverity = std::max(0.0, ForecastLoad(n) / ref - 0.5);
-    return currentSeverity < riskBar && forecastSeverity >= riskBar;
+    // Confirmed congestion with significant drops under load
+    return (n.dropThisTick >= 2 && n.load >= 0.05);
 }
 
 // Real success/failure signal for trust, fed from Ipv4L3Protocol's own Tx
@@ -410,12 +421,24 @@ DropTraceCallback(uint32_t nodeIdx,
 int32_t
 SelectMigrationTarget(uint32_t sourceIdx, const std::vector<uint32_t>& neighbours)
 {
+    Vector bsPos(500.0, 450.0, 0.0);
+    Vector srcPos = g_mobileNodes[sourceIdx]->GetObject<MobilityModel>()->GetPosition();
+    double srcDistToBS = CalculateDistance(srcPos, bsPos);
+
     std::vector<uint32_t> free;
     for (uint32_t n : neighbours)
     {
-        if (g_agents[n].status != NodeStatusEnum::CONGESTED)
+        // Must not be congested, must not be currently in an active migration state
+        if (g_agents[n].status != NodeStatusEnum::CONGESTED && !g_agents[n].isMigrating)
         {
-            free.push_back(n);
+            Vector candPos = g_mobileNodes[n]->GetObject<MobilityModel>()->GetPosition();
+            double candDistToBS = CalculateDistance(candPos, bsPos);
+            // Must have active route cache (or 1-hop direct line to BS) and make forward progress
+            bool hasWarmRoute = (candDistToBS <= TX_RANGE) || (g_agents[n].load > 0.0);
+            if (hasWarmRoute && (candDistToBS <= srcDistToBS - 10.0 || candDistToBS <= TX_RANGE))
+            {
+                free.push_back(n);
+            }
         }
     }
     if (free.empty())
@@ -425,7 +448,6 @@ SelectMigrationTarget(uint32_t sourceIdx, const std::vector<uint32_t>& neighbour
 
     if (g_scheme == "gebpdcm")
     {
-        Vector srcPos = g_mobileNodes[sourceIdx]->GetObject<MobilityModel>()->GetPosition();
         uint32_t best = free[0];
         double bestDist = 1e18;
         for (uint32_t n : free)
@@ -464,28 +486,38 @@ SelectMigrationTarget(uint32_t sourceIdx, const std::vector<uint32_t>& neighbour
 // --- real migration mechanism: bounded-duration static host-route override
 
 void
-RemoveMigrationRoute(uint32_t srcIdx, uint32_t routeIdx)
+RemoveMigrationRoute(uint32_t srcIdx)
 {
+    g_agents[srcIdx].isMigrating = false;
     Ipv4StaticRoutingHelper srHelper;
     Ptr<Ipv4StaticRouting> sr = srHelper.GetStaticRouting(g_mobileNodes[srcIdx]->GetObject<Ipv4>());
-    if (routeIdx < sr->GetNRoutes())
+    if (!sr) return;
+    for (uint32_t r = 0; r < sr->GetNRoutes(); ++r)
     {
-        sr->RemoveRoute(routeIdx);
+        Ipv4RoutingTableEntry entry = sr->GetRoute(r);
+        if (entry.GetDest() == g_bsAddr)
+        {
+            sr->RemoveRoute(r);
+            break;
+        }
     }
 }
 
 void
 InstallMigrationRoute(uint32_t srcIdx, uint32_t targetIdx)
 {
+    if (g_agents[srcIdx].isMigrating)
+    {
+        return; // already has an active migration override
+    }
     Ipv4StaticRoutingHelper srHelper;
     Ptr<Ipv4StaticRouting> sr = srHelper.GetStaticRouting(g_mobileNodes[srcIdx]->GetObject<Ipv4>());
+    if (!sr) return;
     const uint32_t wifiIfIndex = 1; // 0 = loopback, 1 = the single wifi interface installed
     sr->AddHostRouteTo(g_bsAddr, g_nodeAddrs[targetIdx], wifiIfIndex);
-    uint32_t routeIdx = sr->GetNRoutes() - 1;
+    g_agents[srcIdx].isMigrating = true;
     g_migrations++;
-    // Half the 1s tick -- approximates Eq6-8's "50% of load moves" as a
-    // real, bounded-duration reroute rather than a literal byte split.
-    Simulator::Schedule(Seconds(0.5), &RemoveMigrationRoute, srcIdx, routeIdx);
+    Simulator::Schedule(Seconds(0.5), &RemoveMigrationRoute, srcIdx);
 }
 
 // --- real load sampling: WiFi MAC transmit queue bytes at this instant ---
@@ -520,7 +552,9 @@ Tick(uint32_t tickNum)
     {
         NodeAgentState& n = g_agents[i];
         double prevLoad = n.load;
-        double sampled = SampleQueueLoadMbps(i);
+        double realTxLoadMbps = (n.txThisTick * 1024.0 * 8.0) / 1e6;
+        double queueLoad = SampleQueueLoadMbps(i);
+        double sampled = realTxLoadMbps + queueLoad;
         n.load = sampled;
         n.loadHistory.push_back(sampled);
         if (n.loadHistory.size() > FORECAST_WINDOW)
@@ -530,12 +564,13 @@ Tick(uint32_t tickNum)
 
         std::vector<uint32_t> neighbours = NeighboursWithin(i);
 
-        // Record multivariate telemetry for Tiny-TTS
-        float delta = static_cast<float>(sampled - prevLoad);
+        // Record multivariate telemetry for Tiny-TTS scaled into training domain
+        float scaled_load = static_cast<float>(sampled * 1000.0);
+        float delta = static_cast<float>((sampled - prevLoad) * 1000.0);
         float n_count = static_cast<float>(neighbours.size());
-        float drops = static_cast<float>(n.dropThisTick);
+        float drops = static_cast<float>(n.dropThisTick * 10.0);
         float sp = static_cast<float>(g_speed);
-        n.telemetryHistory.push_back({static_cast<float>(sampled), delta, n_count, drops, sp});
+        n.telemetryHistory.push_back({scaled_load, delta, n_count, drops, sp});
         if (n.telemetryHistory.size() > TinyTTS::SEQ_LEN)
         {
             n.telemetryHistory.erase(n.telemetryHistory.begin());
@@ -554,16 +589,27 @@ Tick(uint32_t tickNum)
                     window[t][f] = n.telemetryHistory[srcIdx][f];
                 }
             }
-            TinyTTS::Predict(window, n.predLoad, n.predRisk);
+            float raw_pred_load = 0.0f;
+            TinyTTS::Predict(window, raw_pred_load, n.predRisk);
+            n.predLoad = raw_pred_load / 1000.0f; // convert back to Mbps
         }
 
         double P = PredictDataLoad(n);
         double Nd = NodeDensity(n, neighbours.size());
-        double cs = NodeStatusScore(P, Nd);
+        double cs = NodeStatusScore(P, Nd, queueLoad);
         n.status = Classify(cs);
 
-        bool needsMigration = n.status == NodeStatusEnum::CONGESTED
-            || (g_scheme == "gebpdcm_ltpm" && ShouldPreemptivelyMigrate(n));
+        bool needsMigration = false;
+        if (g_scheme == "gebpdcm" || g_scheme == "gebpdcm_geo")
+        {
+            needsMigration = (n.status == NodeStatusEnum::CONGESTED);
+        }
+        else if (g_scheme == "gebpdcm_ltpm")
+        {
+            // Tiny-TTS low-false-alarm predictive trigger or confirmed congestion with drops
+            needsMigration = (n.predRisk >= 0.5f && n.load >= 0.02) || (n.status == NodeStatusEnum::CONGESTED && n.dropThisTick > 0);
+        }
+
         if (needsMigration && g_scheme != "baseline")
         {
             int32_t target = SelectMigrationTarget(i, neighbours);
@@ -583,9 +629,9 @@ Tick(uint32_t tickNum)
             {
                 UpdateTrust(i, success);
             }
-            n.txThisTick = 0;
-            n.dropThisTick = 0;
         }
+        n.txThisTick = 0;
+        n.dropThisTick = 0;
 
         switch (n.status)
         {
@@ -760,7 +806,30 @@ main(int argc, char* argv[])
     }
     g_bsAddr = interfaces.GetAddress(NUM_NODES);
 
-    if (scheme == "gebpdcm_ltpm")
+    // Remove the default 10.1.1.0/24 subnet route from static routing on all nodes.
+    // Static routing has priority 10 in Ipv4ListRouting (to allow migration overrides).
+    // If the /24 network route remains in StaticRouting, it intercepts ALL packets and
+    // treats them as 1-hop on-link WiFi, completely shadowing AODV (priority 0) and
+    // breaking multi-hop delivery for any node beyond 300m of the Base Station.
+    // Removing the /24 route allows all normal packets to fall through to AODV, while
+    // temporary /32 host routes installed by migration continue to override AODV.
+    for (uint32_t i = 0; i < allNodes.GetN(); ++i)
+    {
+        Ptr<Ipv4StaticRouting> sr = staticRoutingHelper.GetStaticRouting(allNodes.Get(i)->GetObject<Ipv4>());
+        if (sr)
+        {
+            for (int32_t r = sr->GetNRoutes() - 1; r >= 0; --r)
+            {
+                Ipv4RoutingTableEntry entry = sr->GetRoute(r);
+                if (entry.GetDestNetworkMask() == Ipv4Mask("255.255.255.0"))
+                {
+                    sr->RemoveRoute(r);
+                }
+            }
+        }
+    }
+
+    if (scheme != "baseline")
     {
         for (uint32_t i = 0; i < NUM_NODES; ++i)
         {

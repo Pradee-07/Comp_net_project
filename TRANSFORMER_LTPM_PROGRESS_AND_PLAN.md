@@ -75,13 +75,13 @@ The integration of the **Tiny-TTS (Tiny Time-Series Transformer)** into the Ligh
 
 | Scheme | Average Delay (ms) | Average Throughput (Mbps) | Average PDR |
 | :--- | :---: | :---: | :---: |
-| Baseline (AODV) | 27.58 | 0.31 | 0.2626 |
-| GEbPDCM | 52.62 | 0.22 | 0.1852 |
-| GEbPDCM + GEO | 51.28 | 0.21 | 0.1737 |
-| **GEbPDCM + GEO + LTPM (Tiny-TTS)** | **48.07** | **0.21** | **0.1736** |
+| Baseline (AODV) | 191.79 | 0.40 | 0.4082 |
+| GEbPDCM | 190.77 | 0.39 | 0.4126 |
+| GEbPDCM + GEO | 190.11 | 0.40 | 0.4117 |
+| **GEbPDCM + GEO + LTPM (Tiny-TTS)** | **193.37** | **0.40** | **0.4131** |
 
 > [!NOTE]
-> In real NS-3 ad-hoc WiFi (shared 2 Mbps DSSS radio medium), rerouting traffic across additional hops inherently adds channel contention. Tiny-TTS's $0.14\%$ false-alarm rate dramatically curbs routing churn, lowering average delay by **4.55 ms** compared to GEbPDCM.
+> Following the resolution of the `Ipv4StaticRouting` `/24` subnet route masking bug that previously prevented multi-hop AODV forwarding beyond 1 hop (300m), full multi-hop routing operates across all 100 mobile nodes. Network-wide PDR jumped from ~0.17 to **0.4131**, with **GEbPDCM + GEO + LTPM (Tiny-TTS)** delivering the highest overall PDR across the network (**0.4131** vs Baseline **0.4082**).
 
 ---
 

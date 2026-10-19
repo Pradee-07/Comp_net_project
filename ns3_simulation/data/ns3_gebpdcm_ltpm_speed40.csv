@@ -1,6 +1,6 @@
 metric,value
-delay_ms,60.718
-throughput_mbps,0.242886
-pdr,0.202583
-packet_drop_ratio,0.797417
-energy_mj,798.88
+delay_ms,202.024
+throughput_mbps,0.382661
+pdr,0.401273
+packet_drop_ratio,0.598727
+energy_mj,13386.4

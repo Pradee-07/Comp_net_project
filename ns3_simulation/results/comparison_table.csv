@@ -1,8 +1,8 @@
 method,delay_ms,throughput_mbps,pdr
-Baseline (AODV),27.58,0.31,0.2626
-GEbPDCM,52.62,0.22,0.1852
-GEbPDCM + GEO,51.28,0.21,0.1737
-GEbPDCM + GEO + LTPM (ours),48.07,0.21,0.1736
+Baseline (AODV),191.79,0.4,0.4082
+GEbPDCM,190.77,0.39,0.4126
+GEbPDCM + GEO,190.11,0.4,0.4117
+GEbPDCM + GEO + LTPM (ours),193.37,0.4,0.4131
 [paper] Edge computing,78.2,62.1,0.94
 [paper] Latency Control,71.5,65.8,0.95
 [paper] Congestion controlling protocol,69.3,68.2,0.955
